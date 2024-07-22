@@ -8,7 +8,9 @@ using Extents: Extent, bounds
 using MapTiles: Tile, extent, wgs84
 import Tyler
 using DimensionalData: Near, DimArray
-
+using FileIO: Stream, @format_str, save
+import ImageMagick
+import HTTP
 export PyramidProvider
 
 struct PyramidProvider{P<:Pyramid} <: TileProviders.AbstractProvider
@@ -70,4 +72,22 @@ end
 TileProviders.max_zoom(p::PyramidProvider) = p.max_zoom
 TileProviders.min_zoom(p::PyramidProvider) = p.min_zoom
 
+function provider_request_handler(p::PyramidProvider)
+    request -> begin
+        k = request.target
+        k = lstrip(k, '/')
+        m = match(r"(\d+)/(\d+)/(\d+).png", k)
+        if m === nothing
+            return HTTP.Response(404, "Error: Malformed url")
+        end
+        z, x, y = tryparse.(Int, m.captures)
+        any(isnothing, (x, y, z)) && return HTTP.Response(404, "Error: Malformed url")
+        data = Tyler.fetch_tile(p, Tile(x, y, z))
+        buf = IOBuffer()
+        save(Stream{format"PNG"}(buf), data)
+        return HTTP.Response(200, take!(buf))
+    end
+end
+HTTP.serve(p::PyramidProvider, args...; kwargs...) = HTTP.serve(provider_request_handler(p), args...; kwargs...)
+HTTP.serve!(p::PyramidProvider, args...; kwargs...) = HTTP.serve!(provider_request_handler(p), args...; kwargs...)
 end
