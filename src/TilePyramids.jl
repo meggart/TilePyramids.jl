@@ -91,3 +91,42 @@ end
 HTTP.serve(p::PyramidProvider, args...; kwargs...) = HTTP.serve(provider_request_handler(p), args...; kwargs...)
 HTTP.serve!(p::PyramidProvider, args...; kwargs...) = HTTP.serve!(provider_request_handler(p), args...; kwargs...)
 end
+
+
+import TileProviders: TileProviders, AbstractProvider, Google
+import HTTP, FileIO, DiskArrays
+import Colors: RGB, FixedPointNumbers
+struct MapTileDiskArray{T,P<:AbstractProvider} <: DiskArrays.ChunkTiledDiskArray{T,3}
+    prov::P
+    zoom::Int
+end
+MapTileDiskArray(prov, zoom) = MapTileDiskArray{FixedPointNumbers.N0f8,typeof(prov)}(prov, zoom)
+DiskArrays.eachchunk(a::MapTileDiskArray) = DiskArrays.GridChunks((3, 256 * 2^a.zoom, 256 * 2^a.zoom), (3, 256, 256))
+DiskArrays.haschunks(a::MapTileDiskArray) = DiskArrays.Chunked()
+
+rgbeltype(::Type{RGB{T}}) where {T} = T
+function Base.getindex(a::MapTileDiskArray, i::DiskArrays.ChunkIndex{<:Any,DiskArrays.OneBasedChunks})
+    _, x, y = i.I.I
+    url = TileProviders.geturl(a.prov, x, y, a.zoom)
+    result = HTTP.get(url; retry=false, readtimeout=4, connect_timeout=4)
+    io = IOBuffer(result.body)
+    format = FileIO.query(io)
+    data = FileIO.load(format)
+    T = rgbeltype(eltype(data))
+    data = reinterpret(reshape, T, data)
+    return DiskArrays.wrapchunk(data, DiskArrays.eachchunk(a)[i.I])
+end
+# prov = Google()
+# prov.options
+# a = MapTileDiskArray(prov, 11);
+# ind = ceil.(Int, size(a) ./ 256 ./ 2)
+
+# a[DiskArrays.ChunkIndex(ind...)]
+
+# import MapTiles: MapTiles, Tile, web_mercator, wgs84
+# t = Tile(2000, 1024, 11)
+# MapTiles.extent(t, wgs84)
+
+# bands = [1, 3]
+# x = 1000:1500
+# y = 200:400
