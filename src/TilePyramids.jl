@@ -1,17 +1,20 @@
 module TilePyramids
 
-using PyramidScheme: Pyramid, nlevels, levels
-import TileProviders
+using PyramidScheme: Pyramid, nlevels, levels, PyramidScheme
 using ColorSchemes: colorschemes
-using Colors: @colorant_str, RGB
+using Colors: @colorant_str, RGB, FixedPointNumbers, RGBA
 using Extents: Extent, bounds
-using MapTiles: Tile, extent, wgs84
+using MapTiles: Tile, extent, wgs84, MapTiles, web_mercator
 import Tyler
+import DimensionalData: X, Y, Dim
 using DimensionalData: Near, DimArray
-using FileIO: Stream, @format_str, save
+using FileIO: Stream, @format_str, save, FileIO
 import ImageMagick
 import HTTP
-export PyramidProvider
+import DiskArrays
+import TileProviders: TileProviders, AbstractProvider, Google
+export PyramidProvider, MapTileDiskArray, MapTileRGBDiskArray
+
 
 struct PyramidProvider{P<:Pyramid} <: TileProviders.AbstractProvider
     p::P
@@ -90,43 +93,101 @@ function provider_request_handler(p::PyramidProvider)
 end
 HTTP.serve(p::PyramidProvider, args...; kwargs...) = HTTP.serve(provider_request_handler(p), args...; kwargs...)
 HTTP.serve!(p::PyramidProvider, args...; kwargs...) = HTTP.serve!(provider_request_handler(p), args...; kwargs...)
-end
 
 
-import TileProviders: TileProviders, AbstractProvider, Google
-import HTTP, FileIO, DiskArrays
-import Colors: RGB, FixedPointNumbers
-struct MapTileDiskArray{T,P<:AbstractProvider} <: DiskArrays.ChunkTiledDiskArray{T,3}
+"DiskArray representing maptiles as 3d arrays with bands"
+struct MapTileDiskArray{T,N,P<:AbstractProvider} <: DiskArrays.ChunkTiledDiskArray{T,N}
     prov::P
     zoom::Int
+    tilesize::Int
+    nband::Int
 end
-MapTileDiskArray(prov, zoom) = MapTileDiskArray{FixedPointNumbers.N0f8,typeof(prov)}(prov, zoom)
-DiskArrays.eachchunk(a::MapTileDiskArray) = DiskArrays.GridChunks((3, 256 * 2^a.zoom, 256 * 2^a.zoom), (3, 256, 256))
+function MapTileDiskArray(prov, zoom, mode=:band)
+    testtile = load_data(prov,zoom,0,0)
+    et = eltype(testtile)
+    nband = if et <: RGB
+        3
+    elseif et <: RGBA
+        4
+    else
+        error("Unknown color type $et")
+    end
+    if mode === :band
+        return MapTileDiskArray{rgbeltype(et),3,typeof(prov)}(prov, zoom,size(testtile,1),nband)
+    elseif mode === :rgb
+        return MapTileDiskArray{et,2,typeof(prov)}(prov, zoom,size(testtile,1),nband)
+    else
+        error("Unknown mode $mode")
+    end
+end
+DiskArrays.eachchunk(a::MapTileDiskArray{<:Any,3}) = DiskArrays.GridChunks((a.nband, a.tilesize * 2^a.zoom, a.tilesize * 2^a.zoom), (a.nband, a.tilesize, a.tilesize))
+DiskArrays.eachchunk(a::MapTileDiskArray{<:Any,2}) = DiskArrays.GridChunks((a.tilesize * 2^a.zoom, a.tilesize * 2^a.zoom), (a.tilesize, a.tilesize))
+
 DiskArrays.haschunks(a::MapTileDiskArray) = DiskArrays.Chunked()
 
 rgbeltype(::Type{RGB{T}}) where {T} = T
-function Base.getindex(a::MapTileDiskArray, i::DiskArrays.ChunkIndex{<:Any,DiskArrays.OneBasedChunks})
+rgbeltype(::Type{RGBA{T}}) where {T} = T
+function Base.getindex(a::MapTileDiskArray{<:Any,3}, i::DiskArrays.ChunkIndex{3,DiskArrays.OneBasedChunks})
     _, x, y = i.I.I
-    url = TileProviders.geturl(a.prov, x, y, a.zoom)
-    result = HTTP.get(url; retry=false, readtimeout=4, connect_timeout=4)
-    io = IOBuffer(result.body)
-    format = FileIO.query(io)
-    data = FileIO.load(format)
+    data = load_data(a.prov,a.zoom,x-1,y-1)
     T = rgbeltype(eltype(data))
     data = reinterpret(reshape, T, data)
     return DiskArrays.wrapchunk(data, DiskArrays.eachchunk(a)[i.I])
 end
-# prov = Google()
-# prov.options
-# a = MapTileDiskArray(prov, 11);
-# ind = ceil.(Int, size(a) ./ 256 ./ 2)
 
-# a[DiskArrays.ChunkIndex(ind...)]
+function Base.getindex(a::MapTileDiskArray{<:Any,2}, i::DiskArrays.ChunkIndex{2,DiskArrays.OneBasedChunks})
+    x, y = i.I.I
+    data = load_data(a.prov,a.zoom,x-1,y-1)
+    return DiskArrays.wrapchunk(data, DiskArrays.eachchunk(a)[i.I])
+end
 
-# import MapTiles: MapTiles, Tile, web_mercator, wgs84
-# t = Tile(2000, 1024, 11)
-# MapTiles.extent(t, wgs84)
+function load_data(prov,zoom,x,y)
+    url = TileProviders.geturl(prov, y, x, zoom)
+    result = HTTP.get(url; retry=false, readtimeout=4, connect_timeout=4)
+    io = IOBuffer(result.body)
+    format = FileIO.query(io)
+    FileIO.load(format)
+end
 
-# bands = [1, 3]
-# x = 1000:1500
-# y = 200:400
+function dimsfromzoomlevel(zoom,tilesize)
+    t1 = Tile(1,1,zoom)
+    ntiles = 2^zoom
+    npix = ntiles*tilesize
+    t2 = Tile(ntiles,ntiles,zoom)
+    ex1 = MapTiles.extent(t1, web_mercator)
+    ex2 = MapTiles.extent(t2, web_mercator)
+    x1,x2 = first(ex1.X),last(ex2.X)
+    y1,y2 = first(ex1.Y),last(ex2.Y)
+    stepx = (x2-x1)/npix
+    stepy = (y2-y1)/npix
+    x = X(range(x1+stepx/2,x2-stepx/2,length=npix))
+    y = Y(range(y1+stepy/2,y2-stepy/2,length=npix))
+    return x,y
+end
+function provtoyax(prov,zoom,mode=:band)
+    a = TilePyramids.MapTileDiskArray(prov, zoom, mode);
+    xdim, ydim = dimsfromzoomlevel(zoom,a.tilesize)
+    if mode === :band
+        coldim = if a.nband == 3
+            Dim{:Band}(["Red", "Green", "Blue"])
+        elseif a.nband == 4
+            Dim{:Band}(["Red", "Green", "Blue","Alpha"])
+        end
+        PyramidScheme.YAXArray((coldim,xdim,ydim),a)
+    else
+        PyramidScheme.YAXArray((xdim,ydim),a)
+    end
+end
+
+function Pyramid(prov::TileProviders.Provider,mode=:band)
+    maxzoom = get(prov.options,:max_zoom,18)
+    base = provtoyax(prov,maxzoom,mode)
+    levels = [provtoyax(prov,zoom,mode) for zoom in (maxzoom-1):-1:0]
+    return Pyramid(base,levels,prov.options)
+end
+
+function Base.showable(::MIME"image/svg+xml", cs::PyramidScheme.YAXArray)
+    false
+  end
+
+end #module
