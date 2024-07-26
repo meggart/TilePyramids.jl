@@ -128,7 +128,7 @@ DiskArrays.haschunks(a::MapTileDiskArray) = DiskArrays.Chunked()
 rgbeltype(::Type{RGB{T}}) where {T} = T
 rgbeltype(::Type{RGBA{T}}) where {T} = T
 function Base.getindex(a::MapTileDiskArray{<:Any,3}, i::DiskArrays.ChunkIndex{3,DiskArrays.OneBasedChunks})
-    _, x, y = i.I.I
+    _, y, x = i.I.I
     data = load_data(a.prov,a.zoom,x-1,y-1)
     T = rgbeltype(eltype(data))
     data = reinterpret(reshape, T, data)
@@ -136,17 +136,25 @@ function Base.getindex(a::MapTileDiskArray{<:Any,3}, i::DiskArrays.ChunkIndex{3,
 end
 
 function Base.getindex(a::MapTileDiskArray{<:Any,2}, i::DiskArrays.ChunkIndex{2,DiskArrays.OneBasedChunks})
-    x, y = i.I.I
+    y, x = i.I.I
     data = load_data(a.prov,a.zoom,x-1,y-1)
     return DiskArrays.wrapchunk(data, DiskArrays.eachchunk(a)[i.I])
 end
 
 function load_data(prov,zoom,x,y)
-    url = TileProviders.geturl(prov, y, x, zoom)
+    url = TileProviders.geturl(prov, x, y, zoom)
     result = HTTP.get(url; retry=false, readtimeout=4, connect_timeout=4)
-    io = IOBuffer(result.body)
-    format = FileIO.query(io)
-    FileIO.load(format)
+    if result.status > 300
+        if result.status == 404
+            return nothing
+        else
+            throw(ErrorException("HTTP error $(result.status)"))
+        end
+    else
+        io = IOBuffer(result.body)
+        format = FileIO.query(io)
+        FileIO.load(format)
+    end
 end
 
 function dimsfromzoomlevel(zoom,tilesize)
@@ -173,9 +181,9 @@ function provtoyax(prov,zoom,mode=:band)
         elseif a.nband == 4
             Dim{:Band}(["Red", "Green", "Blue","Alpha"])
         end
-        PyramidScheme.YAXArray((coldim,xdim,ydim),a)
+        PyramidScheme.YAXArray((coldim, ydim, xdim), a)
     else
-        PyramidScheme.YAXArray((xdim,ydim),a)
+        PyramidScheme.YAXArray((ydim, xdim), a)
     end
 end
 
